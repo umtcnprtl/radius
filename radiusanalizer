@@ -1,0 +1,122 @@
+import os
+import pandas as pd
+import re
+from tabulate import tabulate
+from collections import defaultdict
+
+def parse_radius_log(file_path):
+    """
+    FreeRADIUS log dosyasını satır satır ayrıştırarak hem kimlik doğrulama,
+    hem de hesap (accounting) ve challenge bilgilerini çıkarır.
+    """
+    if not os.path.exists(file_path):
+        print(f"❌ HATA: Dosya bulunamadı! -> {file_path}")
+        return pd.DataFrame(), []
+
+    # defaultdict kullanarak anahtar yoksa otomatik olarak varsayılan bir değer atıyoruz.
+    sessions = defaultdict(lambda: {"flow": []})
+    challenge_entries = []
+
+    with open(file_path, "r", encoding="utf-8", errors='ignore') as file:
+        for line in file:
+            line = line.strip()
+
+            request_id_match = re.match(r'\((\d+)\)', line)
+            if not request_id_match:
+                continue
+
+            request_id = request_id_match.group(1)
+            sessions[request_id]["request_id"] = request_id
+
+            # --- Olay Akışını ve Durumunu Belirle ---
+
+            if "Received Access-Request" in line:
+                sessions[request_id]['request_type'] = 'Authentication'
+                sessions[request_id]['flow'].append('Access-Request')
+            elif "Sent Access-Accept" in line:
+                sessions[request_id]['status'] = 'Accept'
+                sessions[request_id]['flow'].append('Access-Accept')
+            elif "Sent Access-Reject" in line:
+                sessions[request_id]['status'] = 'Reject'
+                sessions[request_id]['flow'].append('Access-Reject')
+            elif "Sent Access-Challenge" in line:
+                sessions[request_id].setdefault('status', 'Challenge') # Eğer başka status yoksa challenge ata
+                sessions[request_id]['flow'].append('Access-Challenge')
+                challenge_entries.append(line)
+
+            elif "Received Accounting-Request" in line:
+                sessions[request_id]['request_type'] = 'Accounting'
+                sessions[request_id]['flow'].append('Accounting-Request')
+            elif "Acct-Status-Type" in line:
+                status_match = re.search(r'Acct-Status-Type = (.*?)$', line)
+                if status_match:
+                    status = status_match.group(1).strip()
+                    sessions[request_id]['status'] = status
+                    sessions[request_id]['flow'].append(f'Acct-{status}')
+
+            # --- Ortak Bilgileri Çıkar ---
+
+            if 'User-Name = "' in line:
+                user_match = re.search(r'User-Name = "(.*?)"', line)
+                if user_match:
+                    sessions[request_id]['user'] = user_match.group(1)
+            
+            if 'NAS-IP-Address =' in line:
+                 nas_ip_match = re.search(r'NAS-IP-Address = (.*?)$', line)
+                 if nas_ip_match:
+                     sessions[request_id]['nas_ip'] = nas_ip_match.group(1).strip()
+            
+            if 'NAS-Port-Type =' in line:
+                port_type_match = re.search(r'NAS-Port-Type = (.*?)$', line)
+                if port_type_match:
+                    sessions[request_id]['nas_port_type'] = port_type_match.group(1).strip()
+
+    log_data = list(sessions.values())
+    return pd.DataFrame(log_data), challenge_entries
+
+
+def analyze_radius_logs():
+    """
+    Kullanıcıdan log dosyasının yolunu alır, analiz eder ve sonuçları tablo
+    ve detaylı döküm formatında yazdırır.
+    """
+    log_file = input("Lütfen FreeRADIUS log dosyasının tam yolunu girin: ")
+    if not os.path.exists(log_file):
+        print(f"❌ HATA: Dosya bulunamadı! -> {log_file}")
+        return
+
+    logs_df, challenge_entries = parse_radius_log(log_file)
+    if logs_df.empty:
+        print("❌ Log dosyasında analiz edilecek veri bulunamadı.")
+        return
+
+    # --- Görüntüleme için DataFrame'i Hazırla ---
+    display_columns = [
+        "request_id", "request_type", "user", "status", "nas_ip", "nas_port_type"
+    ]
+    existing_columns = [col for col in display_columns if col in logs_df.columns]
+    display_df = logs_df[existing_columns].fillna("N/A")
+
+    print("\n📊 **FreeRADIUS Kapsamlı Log Analizi (Auth & Acct)**\n")
+    print(tabulate(display_df, headers="keys", tablefmt="grid"))
+
+    # --- Bağlantı Yaşam Döngüsünü Göster ---
+    print("\n🔄 **Bağlantı Yaşam Döngüsü:**")
+    # Sadece anlamlı bir akışı olan satırları al
+    lifecycle_df = logs_df[logs_df['flow'].map(lambda x: len(x) > 0)].fillna("Bilinmiyor")
+    if lifecycle_df.empty:
+        print("  - Yaşam döngüsü bilgisi bulunamadı.")
+    else:
+        for index, row in lifecycle_df.iterrows():
+            flow_str = " -> ".join(row['flow'])
+            print(f"  - İstek ID: {row['request_id']} | Kullanıcı: {row['user']} | Durum: {row['status']}")
+            print(f"    Süreç: {flow_str}")
+
+    # --- Access-Challenge Girdilerini Göster ---
+    if challenge_entries:
+        print("\n챌 **Access-Challenge Girdileri:**")
+        for entry in challenge_entries:
+            print(f"  - {entry}")
+
+if __name__ == "__main__":
+    analyze_radius_logs()
